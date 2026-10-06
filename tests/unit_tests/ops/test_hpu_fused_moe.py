@@ -158,3 +158,46 @@ def test_swigluoai_moe_dispatch(monkeypatch, enabled: bool, tokens: int, top_k: 
 
     assert result is x
     assert calls == [expected_path]
+
+
+@pytest.mark.parametrize("experts_min", [0, 8, 256])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_moe_op_expert_parallel_offset(experts_min: int, compiled: bool):
+    """An EP rank's op (experts_min > 0) must only apply its own experts.
+
+    The eager mixture_of_experts kernel ignores experts_min, so the op wrapper
+    rebases the routing table to local ids; check both eager and compiled.
+    """
+    from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOp
+
+    torch.manual_seed(0)
+    local, global_experts, hidden, inter, tokens, top_k = 8, 512, 128, 64, 16, 2
+    op = VllmMixtureOfExpertsOp(global_experts, local, experts_min, experts_min + local - 1)
+    w13 = torch.randn(local, 2 * inter, hidden, dtype=torch.bfloat16) * 0.05
+    w2 = torch.randn(local, hidden, inter, dtype=torch.bfloat16) * 0.05
+    for j in range(local):
+        op.w13_list[j].set_weight(w13[j].to("hpu"))
+        op.w2_list[j].set_weight(w2[j].to("hpu"))
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+    # Distinct experts per token (as top-k yields); half the tokens hit a local expert.
+    topk_ids = torch.randperm(global_experts)[:tokens * top_k].view(tokens, top_k)
+    for t in range(tokens // 2):
+        topk_ids[t, 0] = experts_min + t % local
+        if topk_ids[t, 1] == topk_ids[t, 0]:
+            topk_ids[t, 1] = (topk_ids[t, 0] + local) % global_experts
+    topk_weights = torch.softmax(torch.randn(tokens, top_k), dim=-1).to(torch.bfloat16)
+
+    ref = torch.zeros(tokens, hidden)
+    for t in range(tokens):
+        for k in range(top_k):
+            j = int(topk_ids[t, k]) - experts_min
+            if 0 <= j < local:
+                gate, up = (x[t].float() @ w13[j].float().T).chunk(2)
+                ref[t] += float(topk_weights[t, k]) * ((torch.nn.functional.silu(gate) * up) @ w2[j].float().T)
+
+    fwd = op.forward
+    if compiled:
+        fwd = torch.compile(fwd, backend="hpu_backend", dynamic=False)
+    out = fwd(x.to("hpu"), topk_ids.to("hpu"), topk_weights.to("hpu"), permuted_weights=True,
+              activation="silu").float().cpu()
+    torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)

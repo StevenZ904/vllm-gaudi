@@ -64,6 +64,25 @@ def _as_activation_str(activation):
     return _MOE_ACTIVATION_ALIASES.get(activation, activation)
 
 
+def _localize_expert_ids(expert_routing_table, experts_min, experts_max):
+    """Rebase a routing table so the op's expert range starts at 0.
+
+    The eager implementation of torch.ops.hpu.mixture_of_experts ignores the
+    experts_min offset and indexes the weight lists with the raw routing ids,
+    so an expert-parallel rank with experts_min > 0 silently computes the wrong
+    experts (the compiled hpu_backend path honours the offset). Subtracting the
+    offset here and passing experts_min=0 / experts_max=experts_max-experts_min
+    gives the same result on both paths; ids owned by other ranks land outside
+    the range and are skipped as before.
+
+    Returns:
+        (routing table, experts_min, experts_max) to pass to the op.
+    """
+    if experts_min != 0:
+        expert_routing_table = expert_routing_table - experts_min
+    return expert_routing_table, 0, experts_max - experts_min
+
+
 def get_inc_quant_method(layer):
     return layer
 
@@ -757,27 +776,29 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
         w2_list = self._cached_w2_views
 
         if self.moe_n_slice == 1:
+            routing_table, experts_min, experts_max = _localize_expert_ids(expert_routing_table, self.experts_min,
+                                                                           self.experts_max)
             if self.bias is not None:
                 return torch.ops.hpu.mixture_of_experts.bias_fused_weights(hidden_states=hidden_states,
-                                                                           expert_routing_table=expert_routing_table,
+                                                                           expert_routing_table=routing_table,
                                                                            router_weights=router_weights,
                                                                            w12=w13_list,
                                                                            w3=w2_list,
                                                                            w12_bias=self._cached_w13_bias_views,
                                                                            w3_bias=self._cached_w2_bias_views,
                                                                            permuted_weights=permuted_weights,
-                                                                           experts_min=self.experts_min,
-                                                                           experts_max=self.experts_max)
+                                                                           experts_min=experts_min,
+                                                                           experts_max=experts_max)
             else:
                 return torch.ops.hpu.mixture_of_experts(hidden_states=hidden_states,
-                                                        expert_routing_table=expert_routing_table,
+                                                        expert_routing_table=routing_table,
                                                         router_weights=router_weights,
                                                         w12=w13_list,
                                                         w3=w2_list,
                                                         permuted_weights=permuted_weights,
                                                         activation=activation,
-                                                        experts_min=self.experts_min,
-                                                        experts_max=self.experts_max,
+                                                        experts_min=experts_min,
+                                                        experts_max=experts_max,
                                                         **kwargs)
 
         if self.bias is not None:
@@ -791,17 +812,19 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
                 w13_bias_list_slice = w13_bias_list[start:end]
                 w2_bias_list_slice = w2_bias_list[start:end]
 
+                routing_table, experts_min, experts_max = _localize_expert_ids(expert_routing_table, self.experts_min,
+                                                                               self.experts_max)
                 slice_final_hidden_states = torch.ops.hpu.mixture_of_experts.bias_fused_weights(
                     hidden_states=hidden_states,
-                    expert_routing_table=expert_routing_table,
+                    expert_routing_table=routing_table,
                     router_weights=router_weights,
                     w12=w13_list,
                     w3=w2_list,
                     w12_bias=w13_bias_list_slice,
                     w3_bias=w2_bias_list_slice,
                     permuted_weights=permuted_weights,
-                    experts_min=self.experts_min,
-                    experts_max=self.experts_max)
+                    experts_min=experts_min,
+                    experts_max=experts_max)
             else:
                 start = i * self.num_expert_per_group
                 end = (i + 1) * self.num_expert_per_group
@@ -809,9 +832,11 @@ class VllmMixtureOfExpertsOp(VllmMixtureOfExpertsOpBase):
                 w2_list_slice = w2_list[start:end]
                 min_expert = self.experts_min + start
                 max_expert = min_expert + self.num_expert_per_group - 1
+                routing_table, min_expert, max_expert = _localize_expert_ids(expert_routing_table, min_expert,
+                                                                             max_expert)
 
                 slice_final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=hidden_states,
-                                                                             expert_routing_table=expert_routing_table,
+                                                                             expert_routing_table=routing_table,
                                                                              router_weights=router_weights,
                                                                              w12=w13_list_slice,
                                                                              w3=w2_list_slice,
@@ -1283,23 +1308,25 @@ class VllmMixtureOfExpertsOpFP8(VllmMixtureOfExpertsOpBase):
         htorch.core.mark_step()
 
         if self.moe_n_slice == 1:
+            routing_table, experts_min, experts_max = _localize_expert_ids(topk_ids, self.experts_min, self.experts_max)
             return torch.ops.hpu.mixture_of_experts(hidden_states=x,
-                                                    expert_routing_table=topk_ids,
+                                                    expert_routing_table=routing_table,
                                                     router_weights=topk_weights,
                                                     w12=w13_list,
                                                     w3=w2_list,
                                                     permuted_weights=permuted_weights,
                                                     activation=activation,
-                                                    experts_min=self.experts_min,
-                                                    experts_max=self.experts_max,
+                                                    experts_min=experts_min,
+                                                    experts_max=experts_max,
                                                     **kwargs)
         for i in range(self.moe_n_slice):
             w13_list_slice = w13_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
             w2_list_slice = w2_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
             min_expert = self.experts_min + i * self.num_expert_per_group
             max_expert = min_expert + self.num_expert_per_group - 1
+            routing_table, min_expert, max_expert = _localize_expert_ids(topk_ids, min_expert, max_expert)
             slice_final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x,
-                                                                         expert_routing_table=topk_ids,
+                                                                         expert_routing_table=routing_table,
                                                                          router_weights=topk_weights,
                                                                          w12=w13_list_slice,
                                                                          w3=w2_list_slice,
@@ -1384,11 +1411,13 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
         w2_list = self._cached_w2_views
         w13_weight_scale = self._cached_w13_scale_views
         w2_weight_scale = self._cached_w2_scale_views
+        routing_table, experts_min, experts_max = _localize_expert_ids(topk_ids.to(torch.int64), self.experts_min,
+                                                                       self.experts_max)
 
         if self.w13_input_scale is None:
             x_fp8, x_scale = dynamic_quant(x)
             final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
-                                                                   expert_routing_table=topk_ids.to(torch.int64),
+                                                                   expert_routing_table=routing_table,
                                                                    router_weights=topk_weights.to(x.dtype),
                                                                    w12=w13_list,
                                                                    w3=w2_list,
@@ -1397,8 +1426,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
                                                                    d_scale_w3=w2_weight_scale,
                                                                    permuted_weights=permuted_weights,
                                                                    activation=activation,
-                                                                   experts_min=self.experts_min,
-                                                                   experts_max=self.experts_max,
+                                                                   experts_min=experts_min,
+                                                                   experts_max=experts_max,
                                                                    **kwargs)
         else:
             x_scale = self.w13_input_scale.data
@@ -1406,7 +1435,7 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
             w2_input_scale = [self.w2_input_scale[i] for i in range(self.num_experts)]
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0 / x_scale, False, False, torch.float8_e4m3fn)[0]
             final_hidden_states = torch.ops.hpu.mixture_of_experts(hidden_states=x_fp8,
-                                                                   expert_routing_table=topk_ids.to(torch.int64),
+                                                                   expert_routing_table=routing_table,
                                                                    router_weights=topk_weights.to(x.dtype),
                                                                    w12=w13_list,
                                                                    w3=w2_list,
@@ -1416,8 +1445,8 @@ class VllmMixtureOfExpertsOpFP8PerChannel(VllmMixtureOfExpertsOpBase):
                                                                    d_scale_w3=w2_weight_scale,
                                                                    permuted_weights=permuted_weights,
                                                                    activation=activation,
-                                                                   experts_min=self.experts_min,
-                                                                   experts_max=self.experts_max,
+                                                                   experts_min=experts_min,
+                                                                   experts_max=experts_max,
                                                                    **kwargs)
 
         return final_hidden_states
@@ -1593,23 +1622,25 @@ class VllmMixtureOfExpertsOpWNA16(torch.nn.Module):
         htorch.core.mark_step()
 
         if self.moe_n_slice == 1:
+            routing_table, experts_min, experts_max = _localize_expert_ids(topk_ids, self.experts_min, self.experts_max)
             return torch.ops.hpu.mixture_of_experts(hidden_states=x,
-                                                    expert_routing_table=topk_ids,
+                                                    expert_routing_table=routing_table,
                                                     router_weights=topk_weights,
                                                     w12=w13_list,
                                                     w3=w2_list,
                                                     permuted_weights=permuted_weights,
                                                     activation=activation,
-                                                    experts_min=self.experts_min,
-                                                    experts_max=self.experts_max)
+                                                    experts_min=experts_min,
+                                                    experts_max=experts_max)
         for i in range(self.moe_n_slice):
             w13_list_slice = w13_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
             w2_list_slice = w2_list[i * self.num_expert_per_group:(i + 1) * self.num_expert_per_group]
             min_expert = self.experts_min + i * self.num_expert_per_group
             max_expert = min_expert + self.num_expert_per_group - 1
+            routing_table, min_expert, max_expert = _localize_expert_ids(topk_ids, min_expert, max_expert)
             slice_final_hidden_states = torch.ops.hpu.mixture_of_experts(
                 hidden_states=x,
-                expert_routing_table=topk_ids,
+                expert_routing_table=routing_table,
                 router_weights=topk_weights,
                 w12=w13_list_slice,
                 w3=w2_list_slice,
