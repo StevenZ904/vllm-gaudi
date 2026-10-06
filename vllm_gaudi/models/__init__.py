@@ -83,3 +83,9 @@ def register_model():
     import vllm_gaudi.models.kimi_k25_vit  # noqa: F401
     import vllm_gaudi.models.kimi_k25  # noqa: F401
     import vllm_gaudi.models.gemma4_mm  # noqa: F401
+
+    # Registered by dotted path so the module is only imported when a Qwen4Exp
+    # checkpoint is loaded.
+    ModelRegistry.register_model("Qwen4ExpForCausalLM", "vllm_gaudi.models.qwen4_exp:HpuQwen4ExpForCausalLM")
+    ModelRegistry.register_model("Qwen4ExpForConditionalGeneration",
+                                 "vllm_gaudi.models.qwen4_exp:HpuQwen4ExpForConditionalGeneration")

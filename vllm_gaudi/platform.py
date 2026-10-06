@@ -36,6 +36,8 @@ torch.accelerator.get_memory_info = _hpu_get_memory_info
 QWEN3_5_HYBRID_ARCHS = frozenset({
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
 })
 
 

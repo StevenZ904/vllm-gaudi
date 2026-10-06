@@ -425,6 +425,15 @@ _run_gsm8k_qwen36_35b_a3b_test() {
     echo "✅ Test with Qwen3.6-35B-A3B passed."
 }
 
+# GSM8K on Qwen3.8-Flash-Next-FP8 (Qwen4Exp: hyper-connections + n-gram embedding, 512-expert MoE)
+# The FP8 checkpoint needs 4 cards; experts are distributed with expert parallelism.
+run_gsm8k_qwen38_flash_next_fp8_test() {
+    echo "➡️ Testing GSM8K on Qwen3.8-Flash-Next-FP8..."
+    TP_SIZE=4 VLLM_SKIP_WARMUP=True ENABLE_APC=False \
+    pytest -v -s "${VLLM_GAUDI_PREFIX}/tests/models/language/generation/test_common.py" --model_card_path "${VLLM_GAUDI_PREFIX}/tests/full_tests/model_cards/qwen3.8-flash-next-fp8.yaml"
+    echo "✅ Test with Qwen3.8-Flash-Next-FP8 passed."
+}
+
 # GSM8K on gemma-4-E4B (YOCO / KV-sharing model)
 _run_gsm8k_gemma4_e4b_test() {
     echo "➡️ Testing GSM8K on gemma-4-E4B-it..."

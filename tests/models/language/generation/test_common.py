@@ -45,6 +45,9 @@ def launch_lm_eval(eval_config):
         model_args["gpu_memory_utilization"] = eval_config["gpu_memory_utilization"]
     if eval_config.get("reasoning_parser") is not None:
         model_args["reasoning_parser"] = eval_config["reasoning_parser"]
+    # Passed directly: lm_eval's VLLM wrapper drops enable_thinking given via chat_template_args.
+    if eval_config.get("enable_thinking") is not None:
+        model_args["enable_thinking"] = eval_config["enable_thinking"]
     if eval_config.get("max_num_batched_tokens") is not None:
         model_args["max_num_batched_tokens"] = eval_config["max_num_batched_tokens"]
     if eval_config.get("add_bos_token") is not None:

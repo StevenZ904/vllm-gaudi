@@ -60,6 +60,8 @@ The following configurations have been validated to function with IntelÂ® GaudiÂ
 | [Qwen/Qwen3-VL-235B-A22B-Thinking-FP8](https://huggingface.co/Qwen/Qwen3-VL-235B-A22B-Thinking-FP8)     | 4    |  FP8    | Gaudi 3|
 | [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)     | 1    | BF16    | Gaudi 3|
 | [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)     | 1    | BF16    | Gaudi 3|
+| [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)     | 8    | BF16    | Gaudi 2|
+| [Qwen/Qwen3.8-Flash-Next-FP8](https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8)     | 4, 8    | FP8    | Gaudi 2|
 | [ibm-granite/granite-4.0-h-small](https://huggingface.co/ibm-granite/granite-4.0-h-small)     | 1    |  BF16    | Gaudi 3|
 | [tencent/Hunyuan-7B-Instruct](https://huggingface.co/tencent/Hunyuan-7B-Instruct)     | 1    | BF16, FP8    | Gaudi 3|
 | [tencent/Hunyuan-A13B-Instruct](https://huggingface.co/tencent/Hunyuan-A13B-Instruct)     | 1    | BF16, FP8    | Gaudi 3|

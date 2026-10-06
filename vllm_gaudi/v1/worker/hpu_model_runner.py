@@ -791,7 +791,7 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
 
     mamba_like_arch = [
         "GraniteMoeHybridForCausalLM", "Qwen3_5MoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration",
-        "Qwen3NextForCausalLM", "NemotronHForCausalLM"
+        "Qwen3NextForCausalLM", "NemotronHForCausalLM", "Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"
     ]
     if not any(arch in getattr(model.config, 'architectures', []) for arch in mamba_like_arch):
         return
@@ -880,7 +880,7 @@ def apply_model_specific_patches(model_runner):
 
     is_llama4 = is_hpu_llama4_model(model_runner.model)
     model_type = getattr(model_runner.vllm_config.model_config.hf_config, "model_type", "")
-    is_qwen_moe = model_type in ("qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe")
+    is_qwen_moe = model_type in ("qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen4_exp", "qwen4_exp_text")
     is_gemma4 = model_type in ("gemma4", )
 
     model_runner._has_heterogeneous_layers = is_llama4 or is_qwen_moe or is_gemma4
