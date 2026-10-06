@@ -1057,6 +1057,17 @@ def get_dequant_weights_func(self, ) -> Optional[Callable[[torch.nn.Module], tor
 
 def gaudi_weight_wrapper(weight_loader):
     """Wrapper for Gaudi weight conversion."""
+    # A FusedMoE layer passes its bound weight_loader, which drops the experts
+    # owned by other expert-parallel ranks. Their FP8 weights need no rescaling,
+    # which is a CPU round trip through fp32.
+    moe_layer = getattr(weight_loader, "__self__", None)
+    map_global_expert_id = getattr(moe_layer, "_map_global_expert_id_to_local_expert_id", None)
+
+    def is_remote_expert(args, kwargs) -> bool:
+        if map_global_expert_id is None:
+            return False
+        expert_id = kwargs.get("expert_id", args[4] if len(args) > 4 else None)
+        return expert_id is not None and map_global_expert_id(expert_id) == -1
 
     def wrapper(*args, **kwargs):
         if get_config().scale_adjustment:
@@ -1072,6 +1083,10 @@ def gaudi_weight_wrapper(weight_loader):
             else:
                 loaded_weight = args[1]
             if loaded_weight.dtype == torch.float8_e4m3fn:
+                # Only weights are skipped: a global input scale is loaded on
+                # every rank.
+                if is_remote_expert(args, kwargs):
+                    return weight_loader(*args, **kwargs)
                 loaded_weight = (loaded_weight.float() * 0.5).to(torch.float8_e4m3fn)
             else:
                 loaded_weight = (loaded_weight.data * 2.0)

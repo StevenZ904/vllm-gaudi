@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import habana_frameworks.torch as htorch
@@ -101,3 +103,40 @@ def test_fp8_moe_method(default_vllm_config: None, dist_init, monkeypatch):
 
     # Check correctness
     torch.testing.assert_close(ref_output, out, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("expert_id_as_kwarg", [True, False])
+def test_gaudi_weight_wrapper_skips_remote_experts(monkeypatch, expert_id_as_kwarg: bool):
+    """FP8 weights of experts owned by another expert-parallel rank are passed through unscaled."""
+    import vllm_gaudi.extension.ops as hpu_ops
+
+    monkeypatch.setattr(hpu_ops, "get_config", lambda: SimpleNamespace(scale_adjustment=True))
+
+    class FakeMoE:
+
+        def __init__(self):
+            self.loaded = {}
+
+        def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+            # This rank owns global experts 2 and 3.
+            return expert_id - 2 if expert_id in (2, 3) else -1
+
+        def weight_loader(self, param, loaded_weight, weight_name, shard_id, expert_id):
+            self.loaded[(weight_name, expert_id)] = loaded_weight
+
+    moe = FakeMoE()
+    loader = hpu_ops.gaudi_weight_wrapper(moe.weight_loader)
+    weight = torch.full((4, 4), 2.0).to(torch.float8_e4m3fn)
+    scale = torch.ones(4)
+    for expert_id in range(4):
+        for name, tensor in (("w13_weight", weight), ("w13_weight_scale_inv", scale)):
+            if expert_id_as_kwarg:
+                loader(None, tensor, name, "w1", expert_id=expert_id)
+            else:
+                loader(None, tensor, name, "w1", expert_id)
+
+    for expert_id in range(4):
+        expected_weight = 1.0 if expert_id in (2, 3) else 2.0
+        assert moe.loaded[("w13_weight", expert_id)].float().eq(expected_weight).all()
+        # Scales are always adjusted: a global input scale is loaded on every rank.
+        assert moe.loaded[("w13_weight_scale_inv", expert_id)].eq(2.0).all()
