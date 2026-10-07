@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GATHER: bool = False
     VLLM_HPU_MOE_GATHER_RATIO: float = 0.4
     VLLM_HPU_MOE_GATHER_VERIFY: bool = False
+    VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 0
     VLLM_COMPACT_GDN: bool = False
 
 # The begin-* and end* here are used by the documentation generator
@@ -109,6 +110,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: float(os.environ.get("VLLM_HPU_MOE_GATHER_RATIO", "0.4")),
     "VLLM_HPU_MOE_GATHER_VERIFY":
     lambda: os.environ.get("VLLM_HPU_MOE_GATHER_VERIFY", "0").lower() in ("1", "true"),
+
+    # Dense FP8 MoE for small batches (silu, FP8 per-channel experts only): up
+    # to this many tokens, every local expert is computed for every token with
+    # two FP8 GEMMs and only the routed (expert, token) rows are combined. It
+    # reads each expert weight once, like the stock fused op, but avoids its
+    # per-expert pipeline, which is the larger cost at decode batch sizes. 0
+    # (default) disables it.
+    "VLLM_HPU_MOE_DENSE_MAX_TOKENS":
+    lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MAX_TOKENS", "0")),
 
     # Use the compact recurrent-state (conv/ssm) layout for gated delta net
     # models. The model runner auto-detects and sets this during init, so read

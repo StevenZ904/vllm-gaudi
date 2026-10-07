@@ -1015,8 +1015,8 @@ def dynamic_quant(data, single_scale=False):
     if single_scale:
         scale = ((torch.abs(data)).max() + 1e-8) / FP8_MAX
     else:
-        scale = ((torch.abs(data)).max(dim=-1).values + 1e-8) / FP8_MAX
-        scale = scale.unsqueeze(-1)
+        # amax: max(dim=-1) also computes the unused indices.
+        scale = (torch.abs(data).amax(dim=-1, keepdim=True) + 1e-8) / FP8_MAX
     data_fp8 = torch.ops.hpu.cast_to_fp8_v2(data, 1.0 / scale, False, False, torch.float8_e4m3fn)[0]
     return data_fp8, scale.float()
 
