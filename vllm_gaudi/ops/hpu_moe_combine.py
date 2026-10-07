@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pure-PyTorch gathered-expert MoE combine for silu + FP8-per-channel weights.
+"""Pure-PyTorch MoE combines for silu + FP8-per-channel weights.
 
-Replaces the Habana ``mixture_of_experts`` combine (a fixed per-layer launch
+``dense_silu_fp8_moe`` computes every local expert for small batches (see its
+docstring). The rest of this note describes ``gather_silu_fp8_moe``, which
+replaces the Habana ``mixture_of_experts`` combine (a fixed per-layer launch
 pipeline) with a leaner active-expert gather + GEMM + weighted-reduce path,
 mirroring ``vllm_gaudi.ops.hpu_fused_moe._gather_swigluoai_moe`` but for a silu
 gated activation and the FP8 per-channel weight layout
@@ -140,4 +142,90 @@ def gather_silu_fp8_moe(
     # ---- weighted sum over experts -> [T, H] ----
     gathered_weights = gate_weights.index_select(1, gather_ids).t()  # [G, T]
     out = (expert_outputs * gathered_weights.unsqueeze(-1)).sum(0)  # [T, H] f32
+    return out.to(x.dtype)
+
+
+def dense_silu_fp8_moe(
+    layer,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the rank-local FP8 silu MoE partial over all local experts.
+
+    For small token counts the stock fused op is dominated by its per-expert
+    pipeline rather than by reading the expert weights. This path runs every
+    local expert on every token as two FP8 GEMMs instead, then reads back only
+    the (expert, token) rows a token is routed to. It reads each expert weight
+    once, like the stock op; the extra FLOPs are cheap while the token count is
+    small (see VLLM_HPU_MOE_DENSE_MAX_TOKENS).
+
+    topk_ids [T,K] int64 (global expert ids), topk_weights [T,K] bf16.
+    Numerics follow the stock op's dynamic scheme: x is FP8-quantized per token,
+    the activation is FP8-quantized per (expert, token) row before the down
+    projection, and the expert sum is accumulated in fp32.
+    """
+    tokens = x.shape[0]
+    w13 = layer.w13_weight  # [E, 2I, H] fp8
+    w2 = layer.w2_weight  # [E, H, I] fp8
+    scale13 = layer.w13_weight_scale_inv  # [E, 2I]
+    scale2 = layer.w2_weight_scale_inv  # [E, H]
+    local_experts, double_intermediate, hidden_size = w13.shape
+    intermediate_size = double_intermediate // 2
+
+    x_fp8, x_scale = _dynamic_quant(x)  # [T,H], [T,1] f32
+
+    # Experts owned by other EP ranks get weight 0 and point at local expert 0.
+    experts_min = int(layer.moe_config.ep_rank * layer.local_num_experts)
+    local_ids = topk_ids - experts_min
+    in_range = (local_ids >= 0) & (local_ids < local_experts)
+    safe_ids = torch.where(in_range, local_ids, torch.zeros_like(local_ids))  # [T,K]
+    safe_weights = torch.where(in_range, topk_weights, torch.zeros_like(topk_weights)).float()  # [T,K]
+    # Row of each routed (expert, token) pair in the flattened [E*T] expert outputs.
+    # The expert offsets come from arange: with dynamic shapes `tokens` is a
+    # symbolic size, and multiplying a tensor by it makes the HPU backend copy
+    # a host scalar to the device outside the compiled graph on every call.
+    num_topk = topk_ids.shape[-1]
+    expert_rows = torch.arange(0, local_experts * tokens, tokens, device=x.device, dtype=safe_ids.dtype)  # [E]
+    token_ids = torch.arange(tokens, device=x.device, dtype=safe_ids.dtype).unsqueeze(1)
+    rows = (expert_rows.index_select(0, safe_ids.reshape(-1)).view(tokens, num_topk) + token_ids).reshape(-1)  # [T*K]
+
+    # Up/gate projection of all experts as one GEMM: [T,H] x [E*2I,H]^T.
+    projected = torch.ops.hpu.fp8_gemm_v2(
+        A=x_fp8,
+        trans_A=False,
+        B=w13.view(local_experts * double_intermediate, hidden_size),
+        trans_B=True,
+        D=None,
+        out_dtype=x.dtype,
+        A_scale_inv=x_scale,
+        B_scale_inv=scale13.reshape(-1),
+        B_scale_shape=[local_experts * double_intermediate],
+        bias=None,
+        accumulate=False,
+    ).view(tokens, local_experts, double_intermediate)
+    gate, up = projected[..., :intermediate_size], projected[..., intermediate_size:]
+    activations = (torch.nn.functional.silu(gate) * up).transpose(0, 1)  # [E,T,I]
+    act_fp8, act_scale = _dynamic_quant(activations)  # [E,T,I], [E,T,1] f32
+
+    # Down projection, batched over experts: [E,T,I] x [E,H,I]^T -> [E,T,H].
+    expert_outputs = torch.ops.hpu.fp8_gemm_v2(
+        A=act_fp8,
+        trans_A=False,
+        B=w2,
+        trans_B=True,
+        D=None,
+        out_dtype=x.dtype,
+        A_scale_inv=None,
+        B_scale_inv=None,
+        B_scale_shape=None,
+        bias=None,
+        accumulate=False,
+    )
+    # Combine only the routed rows (about K / num_ep_ranks per token) instead
+    # of reducing the whole [E,T,H] tensor.
+    routed = expert_outputs.reshape(-1, hidden_size).index_select(0, rows).view(tokens, num_topk, hidden_size)
+    coef = safe_weights * act_scale.reshape(-1).index_select(0, rows).view(tokens, num_topk)
+    routed_scale2 = scale2.index_select(0, safe_ids.reshape(-1)).view(tokens, num_topk, hidden_size)
+    out = (routed.float() * routed_scale2 * coef.unsqueeze(-1)).sum(1)  # [T,H] f32
     return out.to(x.dtype)

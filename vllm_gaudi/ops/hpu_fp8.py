@@ -53,6 +53,13 @@ if _HPU_MOE_GATHER:
     from vllm_gaudi.ops.hpu_moe_combine import gather_silu_fp8_moe  # noqa: E402
 else:
     gather_silu_fp8_moe = None  # type: ignore[assignment]
+# Token count up to which the dense all-local-experts path replaces the stock op
+# (0 = off). See envs.py.
+_HPU_MOE_DENSE_MAX_TOKENS = envs.VLLM_HPU_MOE_DENSE_MAX_TOKENS
+if _HPU_MOE_DENSE_MAX_TOKENS > 0:
+    from vllm_gaudi.ops.hpu_moe_combine import dense_silu_fp8_moe  # noqa: E402
+else:
+    dense_silu_fp8_moe = None  # type: ignore[assignment]
 
 if _HPU_MOE_GATHER_VERIFY:
     logger.info("MoE gather combine VERIFY mode enabled: comparing custom vs stock "
@@ -384,7 +391,17 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         use_gather = (_HPU_MOE_GATHER and activation == "silu" and self.quant_config.activation_scheme != "static"
                       and self._moe_gather_ok
                       and x.shape[0] * topk_ids.shape[-1] <= layer.local_num_experts * _HPU_MOE_GATHER_RATIO)
-        if use_gather:
+        # The dense path needs the same per-channel weights as the gather path,
+        # and x must already be dispatched across DP (the stock op dispatches
+        # quantized x itself when use_dispatch_fn is set).
+        use_dense = (not use_gather and _HPU_MOE_DENSE_MAX_TOKENS > 0 and activation == "silu"
+                     and self.quant_config.activation_scheme != "static" and self._moe_gather_ok
+                     and getattr(layer.moe_op, "is_gated", True)
+                     and not (layer.moe_config.dp_size > 1 and self.has_moe_quant_config and self.use_dispatch_fn)
+                     and x.shape[0] <= _HPU_MOE_DENSE_MAX_TOKENS)
+        if use_dense:
+            output = dense_silu_fp8_moe(layer, x, topk_ids, topk_weights)
+        elif use_gather:
             # EXPERIMENTAL custom combine: gather only the routed experts
             # (bypasses the Habana op's fixed per-layer stage pipeline).
             if _HPU_MOE_GATHER_VERIFY:

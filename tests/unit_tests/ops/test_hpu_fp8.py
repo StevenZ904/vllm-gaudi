@@ -140,3 +140,70 @@ def test_gaudi_weight_wrapper_skips_remote_experts(monkeypatch, expert_id_as_kwa
         assert moe.loaded[("w13_weight", expert_id)].float().eq(expected_weight).all()
         # Scales are always adjusted: a global input scale is loaded on every rank.
         assert moe.loaded[("w13_weight_scale_inv", expert_id)].eq(2.0).all()
+
+
+@pytest.mark.parametrize("ep_rank", [0, 2])
+@pytest.mark.parametrize("tokens", [1, 16, 64])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_dense_silu_fp8_moe_matches_stock_op(ep_rank: int, tokens: int, compiled: bool):
+    """The dense all-local-experts path must be as accurate as the stock per-channel FP8 op.
+
+    Both quantize activations to FP8 with different rounding, so each is compared
+    with an fp32 reference on the same FP8 weights.
+    """
+    from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOpFP8PerChannel, dynamic_quant
+    from vllm_gaudi.ops.hpu_moe_combine import dense_silu_fp8_moe
+
+    torch.manual_seed(0)
+    local, global_experts, hidden, inter, top_k = 16, 64, 256, 128, 4
+    experts_min = ep_rank * local
+    w13, s13 = dynamic_quant(torch.randn(local, 2 * inter, hidden, dtype=torch.bfloat16, device="hpu") * 0.05)
+    w2, s2 = dynamic_quant(torch.randn(local, hidden, inter, dtype=torch.bfloat16, device="hpu") * 0.05)
+    s13, s2 = s13.squeeze(-1), s2.squeeze(-1)
+    layer = SimpleNamespace(w13_weight=w13,
+                            w2_weight=w2,
+                            w13_weight_scale_inv=s13,
+                            w2_weight_scale_inv=s2,
+                            local_num_experts=local,
+                            moe_config=SimpleNamespace(ep_rank=ep_rank))
+    op = VllmMixtureOfExpertsOpFP8PerChannel(global_experts, local, experts_min, experts_min + local - 1)
+    for j in range(local):
+        op.w13_list[j].set_weight(w13[j])
+        op.w13_list[j].set_scale_inv_fp8(s13[j])
+        op.w2_list[j].set_weight(w2[j])
+        op.w2_list[j].set_scale_inv_fp8(s2[j])
+
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+    # Distinct global experts per token; every token hits at least one local expert.
+    topk_ids = torch.stack([torch.randperm(global_experts)[:top_k] for _ in range(tokens)])
+    topk_ids[:, 0] = experts_min + torch.arange(tokens) % local
+    for t in range(tokens):
+        while (topk_ids[t, 1:] == topk_ids[t, 0]).any():
+            topk_ids[t, 1:] = torch.randperm(global_experts)[:top_k - 1]
+    topk_weights = torch.softmax(torch.randn(tokens, top_k), dim=-1).to(torch.bfloat16)
+
+    w13_ref = (w13.float() * s13.unsqueeze(-1)).cpu()
+    w2_ref = (w2.float() * s2.unsqueeze(-1)).cpu()
+    ref = torch.zeros(tokens, hidden)
+    for t in range(tokens):
+        for k in range(top_k):
+            j = int(topk_ids[t, k]) - experts_min
+            if 0 <= j < local:
+                gate, up = (w13_ref[j] @ x[t].float()).chunk(2)
+                ref[t] += float(topk_weights[t, k]) * (w2_ref[j] @ (torch.nn.functional.silu(gate) * up))
+
+    dense = dense_silu_fp8_moe
+    stock = op.forward
+    if compiled:
+        dense = torch.compile(dense, backend="hpu_backend", dynamic=False)
+        stock = torch.compile(stock, backend="hpu_backend", dynamic=False)
+    x, topk_ids, topk_weights = x.to("hpu"), topk_ids.to("hpu"), topk_weights.to("hpu")
+    out = dense(layer, x, topk_ids, topk_weights).float().cpu()
+    out_stock = stock(x, topk_ids, topk_weights, permuted_weights=True, activation="silu").float().cpu()
+    assert out.shape == (tokens, hidden)
+    err = ((out - ref).norm() / ref.norm()).item()
+    err_stock = ((out_stock - ref).norm() / ref.norm()).item()
+    assert err < 0.08, err
+    # One token is too few samples to rank the two roundings.
+    if tokens >= 16:
+        assert err <= 1.15 * err_stock + 5e-3, (err, err_stock)
