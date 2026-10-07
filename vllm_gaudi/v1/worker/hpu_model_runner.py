@@ -88,6 +88,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.utils import bind_kv_cache, add_kv_sharing_layers_to_kv_cache_groups
 from vllm.v1.utils import CpuGpuBuffer
 from vllm_gaudi.v1.worker.hpu_input_batch import InputBatch, CachedRequestState
+from vllm_gaudi.v1.sample.hpu_topk_topp_sampler import HPUTopKTopPSampler, top_k_bucket
 from vllm.distributed.parallel_state import get_pp_group, get_dp_group
 from vllm.model_executor.models.interfaces import (supports_eagle3, supports_transcription)
 from vllm.model_executor.models.interfaces_base import (VllmModelForPooling, is_pooling_model, is_text_generation_model)
@@ -1267,6 +1268,12 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         self.supports_mm_inputs = False
 
         self.sampler = Sampler()
+        # Top-k-first sampling when every scheduled request sets a small top-k;
+        # _run_sampling sets its max_top_k bound from the host-side values.
+        self.topk_first_sampler: Optional[HPUTopKTopPSampler] = None
+        if gaudi_envs.VLLM_HPU_TOPK_FIRST_SAMPLER:
+            self.topk_first_sampler = HPUTopKTopPSampler(self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel)
+            self.sampler.topk_topp_sampler = self.topk_first_sampler
 
         # NOTE(kzawora) update_env is a hack to work around VLLMKVCache in
         # hpu-extension which selects fetch_from_cache implementation based
@@ -4088,7 +4095,17 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Async scheduling: repair -1 placeholders before penalties read them.
         self.input_batch.update_async_output_token_ids()
         sampling_metadata = self._prepare_sampling(batch_changed, request_ids, pad_to, logits_requests)
-        sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
+        if self.topk_first_sampler is None:
+            sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
+        else:
+            # The bound holds only for the rows selected above, so clear it for
+            # any other caller of the sampler.
+            max_top_k = self.input_batch.selected_max_top_k
+            self.topk_first_sampler.max_top_k = None if max_top_k is None else top_k_bucket(max_top_k)
+            try:
+                sampler_output = self.sampler(logits=logits_device, sampling_metadata=sampling_metadata)
+            finally:
+                self.topk_first_sampler.max_top_k = None
         htorch.core.mark_step()
         return sampler_output, sampling_metadata
 
