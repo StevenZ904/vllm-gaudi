@@ -27,6 +27,9 @@ def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
 
 
 class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+    # The prefill path takes a right-padded [bs, seq] batch with per-row
+    # lengths and state slots, so the runner may merge fresh prompts.
+    supports_padded_prefill_batch = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
