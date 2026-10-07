@@ -107,14 +107,16 @@ def test_fp8_moe_method(default_vllm_config: None, dist_init, monkeypatch):
 @pytest.mark.parametrize("ep_rank", [0, 2])
 @pytest.mark.parametrize("tokens", [1, 16, 64])
 @pytest.mark.parametrize("compiled", [False, True])
-def test_dense_silu_fp8_moe_matches_stock_op(ep_rank: int, tokens: int, compiled: bool):
+@pytest.mark.parametrize("fused_down", [False, True])
+def test_dense_silu_fp8_moe_matches_stock_op(ep_rank: int, tokens: int, compiled: bool, fused_down: bool):
     """The dense all-local-experts path must be as accurate as the stock per-channel FP8 op.
 
     Both quantize activations to FP8 with different rounding, so each is compared
-    with an fp32 reference on the same FP8 weights.
+    with an fp32 reference on the same FP8 weights. With fused_down the dense path
+    uses the requantized [H, E*I] copy of w2.
     """
     from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOpFP8PerChannel, dynamic_quant
-    from vllm_gaudi.ops.hpu_moe_combine import dense_silu_fp8_moe
+    from vllm_gaudi.ops.hpu_moe_combine import dense_silu_fp8_moe, prepare_dense_fused_down
 
     torch.manual_seed(0)
     local, global_experts, hidden, inter, top_k = 16, 64, 256, 128, 4
@@ -154,6 +156,8 @@ def test_dense_silu_fp8_moe_matches_stock_op(ep_rank: int, tokens: int, compiled
                 gate, up = (w13_ref[j] @ x[t].float()).chunk(2)
                 ref[t] += float(topk_weights[t, k]) * (w2_ref[j] @ (torch.nn.functional.silu(gate) * up))
 
+    if fused_down:
+        prepare_dense_fused_down(layer)
     dense = dense_silu_fp8_moe
     stock = op.forward
     if compiled:

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GATHER_RATIO: float = 0.4
     VLLM_HPU_MOE_GATHER_VERIFY: bool = False
     VLLM_HPU_MOE_DENSE_MAX_TOKENS: int = 0
+    VLLM_HPU_MOE_DENSE_FUSED_DOWN: bool = False
     VLLM_COMPACT_GDN: bool = False
 
 # The begin-* and end* here are used by the documentation generator
@@ -119,6 +120,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (default) disables it.
     "VLLM_HPU_MOE_DENSE_MAX_TOKENS":
     lambda: int(os.environ.get("VLLM_HPU_MOE_DENSE_MAX_TOKENS", "0")),
+
+    # With the dense MoE path enabled, also keep a copy of the down-projection
+    # weights laid out as one [H, E*I] matrix, so the dense path runs its down
+    # projection as a single GEMM that sums over experts instead of a batched
+    # GEMM plus a gather. Costs one extra copy of the local w2 weights.
+    "VLLM_HPU_MOE_DENSE_FUSED_DOWN":
+    lambda: os.environ.get("VLLM_HPU_MOE_DENSE_FUSED_DOWN", "0").lower() in ("1", "true"),
 
     # Use the compact recurrent-state (conv/ssm) layout for gated delta net
     # models. The model runner auto-detects and sets this during init, so read

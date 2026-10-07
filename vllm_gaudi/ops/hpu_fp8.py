@@ -57,9 +57,9 @@ else:
 # (0 = off). See envs.py.
 _HPU_MOE_DENSE_MAX_TOKENS = envs.VLLM_HPU_MOE_DENSE_MAX_TOKENS
 if _HPU_MOE_DENSE_MAX_TOKENS > 0:
-    from vllm_gaudi.ops.hpu_moe_combine import dense_silu_fp8_moe  # noqa: E402
+    from vllm_gaudi.ops.hpu_moe_combine import dense_silu_fp8_moe, prepare_dense_fused_down  # noqa: E402
 else:
-    dense_silu_fp8_moe = None  # type: ignore[assignment]
+    dense_silu_fp8_moe = prepare_dense_fused_down = None  # type: ignore[assignment]
 
 if _HPU_MOE_GATHER_VERIFY:
     logger.info("MoE gather combine VERIFY mode enabled: comparing custom vs stock "
@@ -323,6 +323,8 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
                                      "activation scales are None.")
                 layer.w13_input_scale = torch.nn.Parameter(layer.w13_input_scale.max(), requires_grad=False)
             layer = hpu_ops.fp8_channel_moe_prepare_weights(layer)
+        if _HPU_MOE_DENSE_MAX_TOKENS > 0 and envs.VLLM_HPU_MOE_DENSE_FUSED_DOWN and self._moe_gather_ok:
+            prepare_dense_fused_down(layer)
 
     def apply_monolithic(
         self,
