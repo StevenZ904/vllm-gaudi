@@ -35,6 +35,15 @@ _GDN_COMPUTE_DTYPE = torch.float32 if os.getenv("VLLM_GDN_COMPUTE_FP32", "1") ==
 # accuracy issues to the solver vs other sources.
 _USE_EXACT_SOLVE = os.getenv("VLLM_GDN_EXACT_SOLVE", "0") == "1"
 
+# VLLM_GDN_SOLVE_BLOCK=b inverts the b x b diagonal blocks of each chunk and
+# merges them pairwise (see _solve_blocked) instead of running the Neumann
+# iteration on the whole chunk. Used when chunk_size / b is a power of two
+# greater than 1; 0 selects the Neumann iteration.
+_SOLVE_BLOCK = int(os.getenv("VLLM_GDN_SOLVE_BLOCK", "16"))
+# Newton steps per diagonal block: log2(16) = 4 is exact in exact arithmetic,
+# two more absorb fp32 rounding.
+_SOLVE_BLOCK_ITERS = 6
+
 
 @torch._dynamo.disable
 def _preprocess_qk_l2norm(q, k):
@@ -377,8 +386,16 @@ def _hpu_solve_lower_triangular_batched(
 ) -> torch.Tensor:
     """Compute L^{-1} for L = I + strictly-lower.
 
-    Dispatches between exact forward substitution (VLLM_GDN_EXACT_SOLVE=1)
-    and approximate Neumann iteration (default).
+    Dispatches between exact forward substitution (VLLM_GDN_EXACT_SOLVE=1),
+    the blocked inverse (default, VLLM_GDN_SOLVE_BLOCK) and the Neumann
+    iteration on the whole chunk (VLLM_GDN_SOLVE_BLOCK=0).
+
+    **Blocked path** (``_solve_blocked``) runs the Neumann update below on the
+    small diagonal blocks only and merges neighbouring blocks exactly. In fp32
+    the whole-chunk iteration passes through partial sums with very large
+    entries when keys are correlated, and it needs about 2*log2(N) steps to
+    settle; the blocked inverse only multiplies true inverse blocks, reaches
+    the same accuracy and costs a fraction of the bmm work for N=128.
 
     **Neumann path** mirrors torch_chunk_gated_delta_rule_opt:
       inv_{k+1} = inv_k - inv_k @ ((L @ inv_k) * strict_lower_mask)
@@ -406,7 +423,8 @@ def _hpu_solve_lower_triangular_batched(
         neumann_iters: fixed iteration budget for inverse refinement. Higher
             values improve accuracy at the cost of more bmm ops (2 per iter).
             Model-dependent: weights with larger beta or slower-decaying g
-            need more iterations for the same residual.
+            need more iterations for the same residual. Not used by the
+            blocked path.
 
     Returns:
         [..., N, N] (approximate or exact) inverse of lmat
@@ -423,6 +441,9 @@ def _hpu_solve_lower_triangular_batched(
 
     if neumann_iters <= 0:
         raise ValueError(f"neumann_iters must be > 0, got {neumann_iters}.")
+
+    if 0 < _SOLVE_BLOCK < n and n % _SOLVE_BLOCK == 0 and (n // _SOLVE_BLOCK) & (n // _SOLVE_BLOCK - 1) == 0:
+        return _solve_blocked(lmat, _SOLVE_BLOCK, _SOLVE_BLOCK_ITERS)
 
     lflat = lmat.reshape(-1, n, n)
 
@@ -442,6 +463,42 @@ def _hpu_solve_lower_triangular_batched(
         inv_flat = inv_flat - update
 
     return inv_flat.reshape(lmat.shape)
+
+
+def _solve_blocked(lmat: torch.Tensor, block: int, block_iters: int) -> torch.Tensor:
+    """L^{-1} for L = I + strictly-lower by blocks.
+
+    Invert the block x block diagonal blocks with the Newton update used by
+    the Neumann path (exact after log2(block) steps in exact arithmetic), then
+    merge neighbours level by level:
+      [[A, 0], [C, D]]^{-1} = [[A^{-1}, 0], [-D^{-1} C A^{-1}, D^{-1}]].
+    Every product only involves true inverse blocks, so fp32 rounding does not
+    see the large partial sums the full-chunk iteration goes through.
+    """
+    n = lmat.shape[-1]
+    lflat = lmat.reshape(-1, n, n)
+    m = lflat.shape[0]
+    nb = n // block
+    diag = torch.stack([lflat[:, i * block:(i + 1) * block, i * block:(i + 1) * block] for i in range(nb)], dim=1)
+    diag = diag.reshape(m * nb, block, block)
+    lower_mask = torch.tril(torch.ones((block, block), dtype=lflat.dtype, device=lflat.device), diagonal=-1)
+    inv = torch.eye(block, dtype=lflat.dtype, device=lflat.device).unsqueeze(0).expand(m * nb, -1, -1).clone()
+    for _ in range(block_iters):
+        inv = inv - torch.bmm(inv, torch.bmm(diag, inv) * lower_mask)
+    inv = inv.reshape(m, nb, block, block)
+
+    size = block
+    while size < n:
+        nb //= 2
+        a_inv = inv[:, 0::2]
+        d_inv = inv[:, 1::2]
+        c = torch.stack(
+            [lflat[:, (2 * i + 1) * size:(2 * i + 2) * size, 2 * i * size:(2 * i + 1) * size] for i in range(nb)],
+            dim=1)
+        x21 = -torch.matmul(torch.matmul(d_inv, c), a_inv)
+        inv = torch.cat([torch.cat([a_inv, torch.zeros_like(a_inv)], dim=-1), torch.cat([x21, d_inv], dim=-1)], dim=-2)
+        size *= 2
+    return inv.reshape(lmat.shape)
 
 
 def _solve_exact_forward_sub(
