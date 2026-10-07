@@ -469,6 +469,42 @@ class TestFusedRecurrentGatedDeltaRule:
         assert out.shape == (1, N, HV, V)
         assert final_state.shape == (5, HV, V, K)
 
+    @pytest.mark.parametrize("use_qk_l2norm", [False, True])
+    def test_all_slots_decode_matches_gather(self, gdn, use_qk_l2norm):
+        """In-place decode over all state rows (batch covers >= 80% of rows) matches gather + scatter."""
+        N, rows = 6, 7
+        H, K, HV, V = 2, 8, 4, 8
+        q, k, v, g, beta = _make_gdn_inputs(1, N, H, HV, K, V, seed=5)
+        cu_seqlens = torch.arange(N + 1, dtype=torch.long)
+        init_state = torch.randn(rows, HV, V, K)
+        # Row 0 and row 5 are not in the batch; -1 is padding and maps to the last row.
+        ssm_idx = torch.tensor([3, 1, 4, 2, -1, -1], dtype=torch.long)
+        kwargs = dict(cu_seqlens=cu_seqlens, ssm_state_indices=ssm_idx, use_qk_l2norm_in_kernel=use_qk_l2norm)
+
+        out_ref, state_ref = gdn.hpu_fused_recurrent_gated_delta_rule(q,
+                                                                      k,
+                                                                      v,
+                                                                      g,
+                                                                      beta,
+                                                                      initial_state=init_state,
+                                                                      inplace_final_state=False,
+                                                                      **kwargs)
+        state = init_state.clone()
+        out, final_state = gdn.hpu_fused_recurrent_gated_delta_rule(q,
+                                                                    k,
+                                                                    v,
+                                                                    g,
+                                                                    beta,
+                                                                    initial_state=state,
+                                                                    inplace_final_state=True,
+                                                                    **kwargs)
+        assert final_state is state
+        real = slice(0, 4)
+        torch.testing.assert_close(out[:, real], out_ref[:, real], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(state[:rows - 1], state_ref[:rows - 1], atol=1e-5, rtol=1e-5)
+        # Rows outside the batch are left bit-identical.
+        assert torch.equal(state[0], init_state[0]) and torch.equal(state[5], init_state[5])
+
 
 # ===================================================================
 # 4. Chunk GDR pipeline tests
