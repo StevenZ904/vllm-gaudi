@@ -146,6 +146,7 @@ class InputBatch:
         self.top_k = torch.empty((max_num_reqs, ), dtype=torch.int32, device=device)
         self.top_k_cpu_tensor = torch.empty((max_num_reqs, ), dtype=torch.int32, device="cpu", pin_memory=pin_memory)
         self.top_k_cpu = self.top_k_cpu_tensor.numpy()
+        self.selected_max_top_k: Optional[int] = None
         self.top_k_reqs: set[str] = set()
 
         self.min_p = torch.empty((max_num_reqs, ), dtype=torch.float32, device=device)
@@ -637,6 +638,13 @@ class InputBatch:
         skip_copy: bool = False,
     ) -> SamplingMetadata:
         req_indices: list[int] = [self.req_id_to_index[req_id] for req_id, _ in req_id_output_token_ids]
+        # Host-side bound on the selected rows' top-k, for the top-k-first
+        # sampler; None when some row has no top-k.
+        self.selected_max_top_k = None
+        if req_indices and not self.no_top_k:
+            max_top_k = int(self.top_k_cpu[req_indices].max())
+            if max_top_k < self.vocab_size:
+                self.selected_max_top_k = max_top_k
         prompt_token_ids = None
         if not skip_copy:
             async_h2d_update(self.temperature_cpu_tensor, self.temperature, req_indices)

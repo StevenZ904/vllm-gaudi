@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     VLLM_HPU_MOE_GATHER: bool = False
     VLLM_HPU_MOE_GATHER_RATIO: float = 0.4
     VLLM_HPU_MOE_GATHER_VERIFY: bool = False
+    VLLM_HPU_TOPK_FIRST_SAMPLER: bool = True
     VLLM_COMPACT_GDN: bool = False
 
 # The begin-* and end* here are used by the documentation generator
@@ -109,6 +110,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: float(os.environ.get("VLLM_HPU_MOE_GATHER_RATIO", "0.4")),
     "VLLM_HPU_MOE_GATHER_VERIFY":
     lambda: os.environ.get("VLLM_HPU_MOE_GATHER_VERIFY", "0").lower() in ("1", "true"),
+
+    # Sample with a top-k-first path when every scheduled request sets a small
+    # top-k (see vllm_gaudi/v1/sample/hpu_topk_topp_sampler.py) instead of
+    # sorting the whole vocabulary.
+    "VLLM_HPU_TOPK_FIRST_SAMPLER":
+    lambda: os.environ.get("VLLM_HPU_TOPK_FIRST_SAMPLER", "1").lower() in ("1", "true"),
 
     # Use the compact recurrent-state (conv/ssm) layout for gated delta net
     # models. The model runner auto-detects and sets this during init, so read
