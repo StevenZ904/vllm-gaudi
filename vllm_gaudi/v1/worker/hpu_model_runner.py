@@ -6460,6 +6460,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             if prompt_buckets:
                 max_seq_len = max(b[1] for b in prompt_buckets)
                 max_seq_buckets = [b for b in prompt_buckets if b[1] == max_seq_len]
+                # Warmup walks the sorted buckets in reverse, so the first
+                # compilation belongs to the last bucket that fits. Its guards
+                # can capture state set lazily during that call (e.g. the MoE
+                # quant config), so it never matches again. With prompt batch
+                # sizes above 1 that bucket does not have the max seq_len;
+                # re-run it too, or its first real request recompiles.
+                first_warmed = next((b for b in reversed(prompt_buckets) if b[1] <= self.max_num_tokens), None)
+                if first_warmed is not None and first_warmed not in max_seq_buckets:
+                    max_seq_buckets.append(first_warmed)
                 logger.info("Validation warmup: %s prompt buckets (seq_len=%s)", len(max_seq_buckets), max_seq_len)
                 self.warmup_graphs(max_seq_buckets, True, kv_caches)
 
