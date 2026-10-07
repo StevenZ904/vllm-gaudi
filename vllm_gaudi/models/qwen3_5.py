@@ -33,6 +33,10 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # cache_group_idx: set later by model runner for hybrid cache
         # lookup.  Stored as tensor so torch.compile treats it as dynamic.
         self.cache_group_idx = None
+        # Compact GDN states only: set by the model adapter before each
+        # forward to this layer's state rows [0, padded batch] (row 0 =
+        # padding) for decode, else None. Decode then updates just those rows.
+        self.gdn_decode_state: torch.Tensor | None = None
 
         # mamba_chunk_size: use explicit config value or default to 128
         # for HPU bucket alignment.
@@ -90,7 +94,8 @@ class HPUGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         state_indices = self._resolve_state_indices(attn_metadata)
 
         conv_state = self.kv_cache[0]
-        ssm_state = self.kv_cache[1]
+        prefix_state = None if is_prompt else self.gdn_decode_state
+        ssm_state = self.kv_cache[1] if prefix_state is None else prefix_state
 
         query_start_loc = attn_metadata.query_start_loc_p
         has_initial_state = getattr(attn_metadata, "has_initial_states_p", None)

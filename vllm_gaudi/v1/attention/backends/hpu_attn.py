@@ -138,7 +138,8 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                              load_indices_tensor=None,
                              store_indices_tensor=None,
                              query_start_loc=None,
-                             seq_lens_tensor=None):
+                             seq_lens_tensor=None,
+                             gdn_state_prefix=None):
         return cls(is_prompt=False,
                    block_mapping=None,
                    alibi_blocks=None,
@@ -161,4 +162,5 @@ class HPUAttentionMetadataV1(HPUAttentionMetadata):
                    load_indices_tensor=load_indices_tensor,
                    store_indices_tensor=store_indices_tensor,
                    query_start_loc=query_start_loc,
-                   query_start_loc_p=query_start_loc)
+                   query_start_loc_p=query_start_loc,
+                   gdn_state_prefix=gdn_state_prefix)

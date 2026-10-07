@@ -505,6 +505,44 @@ class TestFusedRecurrentGatedDeltaRule:
         # Rows outside the batch are left bit-identical.
         assert torch.equal(state[0], init_state[0]) and torch.equal(state[5], init_state[5])
 
+    def test_prefix_view_decode_matches_full_state(self, gdn):
+        """Decode on the row prefix [0, N] of a larger state (padding -> row 0) matches the full-state path."""
+        N, rows = 6, 12
+        H, K, HV, V = 2, 8, 4, 8
+        q, k, v, g, beta = _make_gdn_inputs(1, N, H, HV, K, V, seed=7)
+        cu_seqlens = torch.arange(N + 1, dtype=torch.long)
+        init_state = torch.randn(rows, HV, V, K)
+        real_rows = [5, 1, 6, 3]
+        kwargs = dict(cu_seqlens=cu_seqlens, use_qk_l2norm_in_kernel=True)
+
+        ref_state = init_state.clone()
+        out_ref, _ = gdn.hpu_fused_recurrent_gated_delta_rule(q,
+                                                              k,
+                                                              v,
+                                                              g,
+                                                              beta,
+                                                              initial_state=ref_state,
+                                                              inplace_final_state=True,
+                                                              ssm_state_indices=torch.tensor(real_rows + [-1, -1]),
+                                                              **kwargs)
+        state = init_state.clone()
+        out, _ = gdn.hpu_fused_recurrent_gated_delta_rule(q,
+                                                          k,
+                                                          v,
+                                                          g,
+                                                          beta,
+                                                          initial_state=state[:N + 1],
+                                                          inplace_final_state=True,
+                                                          ssm_state_indices=torch.tensor(real_rows + [0, 0]),
+                                                          **kwargs)
+        real = slice(0, len(real_rows))
+        torch.testing.assert_close(out[:, real], out_ref[:, real], atol=1e-5, rtol=1e-5)
+        # The update lands in the full tensor; other rows of the prefix and
+        # every row past it are unchanged.
+        torch.testing.assert_close(state[real_rows], ref_state[real_rows], atol=1e-5, rtol=1e-5)
+        for row in [2, 4] + list(range(N + 1, rows)):
+            assert torch.equal(state[row], init_state[row])
+
 
 # ===================================================================
 # 4. Chunk GDR pipeline tests
