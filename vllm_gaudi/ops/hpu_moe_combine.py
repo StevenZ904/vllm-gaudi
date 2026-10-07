@@ -145,6 +145,31 @@ def gather_silu_fp8_moe(
     return out.to(x.dtype)
 
 
+def prepare_dense_fused_down(layer) -> None:
+    """Add ``layer.w2_dense_weight`` [H, E*I] FP8 and ``layer.w2_dense_scale`` [H].
+
+    The local down-projection weights are dequantized one expert block at a time,
+    laid out with the expert dimension folded into the contraction dimension, and
+    requantized per output channel. The stock op keeps using ``w2_weight``.
+    """
+    from vllm_gaudi.extension.ops import FP8_MAX
+    w2 = layer.w2_weight  # [E, H, I] fp8
+    scale2 = layer.w2_weight_scale_inv.float()  # [E, H]
+    local_experts, hidden_size, intermediate_size = w2.shape
+    # Per output channel, the largest dequantized magnitude over all experts.
+    amax = torch.zeros(hidden_size, device=w2.device, dtype=torch.float32)
+    for e in range(local_experts):
+        amax = torch.maximum(amax, w2[e].float().abs().amax(dim=-1) * scale2[e])
+    scale = amax.clamp(min=1e-12) / FP8_MAX  # [H]
+    weight = torch.empty(hidden_size, local_experts, intermediate_size, device=w2.device, dtype=w2.dtype)
+    for e in range(local_experts):
+        dequant = w2[e].float() * scale2[e].unsqueeze(-1)  # [H, I]
+        weight[:, e] = torch.ops.hpu.cast_to_fp8_v2(dequant, 1.0 / scale.unsqueeze(-1), False, False, w2.dtype)[0]
+    layer.w2_dense_weight = torch.nn.Parameter(weight.view(hidden_size, local_experts * intermediate_size),
+                                               requires_grad=False)
+    layer.w2_dense_scale = torch.nn.Parameter(scale, requires_grad=False)
+
+
 def dense_silu_fp8_moe(
     layer,
     x: torch.Tensor,
@@ -205,6 +230,27 @@ def dense_silu_fp8_moe(
         accumulate=False,
     ).view(tokens, local_experts, double_intermediate)
     gate, up = projected[..., :intermediate_size], projected[..., intermediate_size:]
+    w2_dense = getattr(layer, "w2_dense_weight", None)
+    if w2_dense is not None:
+        # Fold the routing weights (0 for unrouted experts) into the activations
+        # and contract over (expert, intermediate) in one GEMM: [T,E*I] x [H,E*I]^T.
+        expert_weights = torch.zeros(tokens, local_experts, device=x.device,
+                                     dtype=torch.float32).scatter_add_(1, safe_ids, safe_weights)  # [T,E]
+        activations = torch.nn.functional.silu(gate) * up * expert_weights.unsqueeze(-1).to(x.dtype)  # [T,E,I]
+        act_fp8, act_scale = _dynamic_quant(activations.reshape(tokens, local_experts * intermediate_size))
+        return torch.ops.hpu.fp8_gemm_v2(
+            A=act_fp8,
+            trans_A=False,
+            B=w2_dense,
+            trans_B=True,
+            D=None,
+            out_dtype=x.dtype,
+            A_scale_inv=act_scale,
+            B_scale_inv=layer.w2_dense_scale,
+            B_scale_shape=[hidden_size],
+            bias=None,
+            accumulate=False,
+        )
     activations = (torch.nn.functional.silu(gate) * up).transpose(0, 1)  # [E,T,I]
     act_fp8, act_scale = _dynamic_quant(activations)  # [E,T,I], [E,T,1] f32
 
