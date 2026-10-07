@@ -786,6 +786,7 @@ def patch_llama4_get_attn_scale(model):
 
 
 def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
+    model = getattr(model, '_orig_mod', model)
     if isinstance(model, HpuModelAdapter):
         model = model.model
 
@@ -2285,10 +2286,11 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         return inputs_embeds, model_mm_kwargs
 
     def get_model(self) -> torch.nn.Module:
-        if isinstance(self.model, HpuModelAdapter):
-            return self.model.model
-        assert self.model is not None
-        return self.model
+        model = getattr(self.model, '_orig_mod', self.model)
+        if isinstance(model, HpuModelAdapter):
+            return model.model
+        assert model is not None
+        return model
 
     def is_decoder_only(self, req_id) -> bool:
         return bool(req_id in self.input_batch.req_type and \
