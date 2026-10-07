@@ -4,13 +4,13 @@
 
 These tests exercise numerical correctness on CPU — no Gaudi hardware
 required.  They cover:
-  - _hpu_solve_lower_triangular_batched: Neumann vs exact solver
+  - _hpu_solve_lower_triangular_batched: Neumann and blocked vs exact solver
   - hpu_chunk_gated_delta_rule: round-trip accuracy vs recurrent reference
   - hpu_fused_recurrent_gated_delta_rule: single-token decode, multi-token
   - hpu_fused_gdn_gating: softplus correctness
   - Edge cases: variable-length sequences, HV != H head mismatch
   - Environment-variable toggles (VLLM_GDN_LEGACY_PHASE_B,
-    VLLM_GDN_COMPUTE_FP32, VLLM_GDN_EXACT_SOLVE)
+    VLLM_GDN_COMPUTE_FP32, VLLM_GDN_EXACT_SOLVE, VLLM_GDN_SOLVE_BLOCK)
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ def _import_gdn(env_overrides: dict[str, str] | None = None):
         "VLLM_GDN_LEGACY_PHASE_B": "0",
         "VLLM_GDN_COMPUTE_FP32": "1",  # fp32 by default in tests for accuracy
         "VLLM_GDN_EXACT_SOLVE": "0",
+        "VLLM_GDN_SOLVE_BLOCK": "0",  # Neumann on the whole chunk unless a test asks for blocks
     }
     if env_overrides:
         env.update(env_overrides)
@@ -57,6 +58,12 @@ def gdn():
 def gdn_exact():
     """GDN module with exact forward-substitution solver."""
     return _import_gdn({"VLLM_GDN_EXACT_SOLVE": "1"})
+
+
+@pytest.fixture
+def gdn_blocked():
+    """GDN module with the blocked solver (16x16 diagonal blocks, the default)."""
+    return _import_gdn({"VLLM_GDN_SOLVE_BLOCK": "16"})
 
 
 @pytest.fixture
@@ -106,6 +113,22 @@ def _make_lower_triangular(n: int, batch: int = 4, *, seed: int = 0):
     off = torch.randn(batch, n, n, generator=gen) * 0.3
     off = torch.tril(off, diagonal=-1)
     return eye.unsqueeze(0) + off, eye
+
+
+def _make_gdn_lower_triangular(n: int, batch: int = 8, *, rho: float = 0.9, seed: int = 0):
+    """L = I + tril(beta_i (k_i . k_j) exp(g_i - g_j), -1) as built in phase A.
+
+    Correlated unit keys (rho), large beta and slow decay make the Neumann
+    partial sums grow far beyond the entries of the true inverse.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    k = torch.randn(batch, n, 64, generator=gen, dtype=torch.float64)
+    shared = torch.randn(batch, 1, 64, generator=gen, dtype=torch.float64)
+    k = F.normalize(k * (1 - rho) + shared * rho * 4, dim=-1)
+    beta = torch.sigmoid(torch.randn(batch, n, generator=gen, dtype=torch.float64) + 2.0)
+    g = torch.cumsum(-torch.rand(batch, n, generator=gen, dtype=torch.float64) * 0.02, dim=-1)
+    a = torch.tril(k @ k.transpose(1, 2) * beta.unsqueeze(-1) * torch.exp(g.unsqueeze(-1) - g.unsqueeze(-2)), -1)
+    return torch.eye(n, dtype=torch.float64) + a
 
 
 # ===================================================================
@@ -248,6 +271,46 @@ class TestSolveLowerTriangularBatched:
         # With n=128 and moderate entries, Neumann may have larger error
         residual = (inv_neumann - inv_exact).abs().max().item()
         assert residual < 1.0, f"Neumann residual too large for n=128: {residual}"
+
+    @pytest.mark.parametrize("n", [32, 64, 128])
+    def test_blocked_matches_fp64_inverse(self, gdn_blocked, n):
+        """Blocked inverse reaches fp32 accuracy on GDN-like correlated keys."""
+        l64 = _make_gdn_lower_triangular(n)
+        ref = torch.linalg.solve_triangular(l64, torch.eye(n, dtype=torch.float64).expand_as(l64), upper=False)
+        inv = gdn_blocked._hpu_solve_lower_triangular_batched(
+            l64.float(),
+            torch.eye(n),
+            use_vectorized=True,
+            neumann_iters=14,
+        )
+        rel = ((inv.double() - ref).norm() / ref.norm()).item()
+        assert rel < 1e-5, f"blocked inverse relative error {rel:.2e} for n={n}"
+
+    def test_blocked_matches_neumann_on_moderate_input(self, gdn, gdn_blocked):
+        """Both solvers agree where the Neumann iteration is well converged."""
+        lmat, eye = _make_lower_triangular(64, batch=3, seed=5)
+        inv_blocked = gdn_blocked._hpu_solve_lower_triangular_batched(lmat, eye, use_vectorized=True, neumann_iters=14)
+        inv_neumann = gdn._hpu_solve_lower_triangular_batched(lmat, eye, use_vectorized=True, neumann_iters=14)
+        torch.testing.assert_close(inv_blocked, inv_neumann, atol=1e-4, rtol=1e-4)
+
+    def test_blocked_keeps_leading_shape(self, gdn_blocked):
+        """Leading batch dims are preserved, like the Neumann path."""
+        lmat, eye = _make_lower_triangular(32, batch=6, seed=3)
+        lmat = lmat.reshape(2, 3, 32, 32)
+        inv = gdn_blocked._hpu_solve_lower_triangular_batched(lmat, eye, use_vectorized=True, neumann_iters=14)
+        assert inv.shape == lmat.shape
+        torch.testing.assert_close(lmat @ inv, eye.expand_as(lmat), atol=1e-4, rtol=1e-4)
+
+    def test_blocked_falls_back_to_neumann(self, gdn, gdn_blocked):
+        """Chunk sizes that are not 16 * 2^k (or not above 16) use the Neumann path."""
+        for n in (16, 48):
+            lmat, eye = _make_lower_triangular(n, batch=2, seed=n)
+            out_blocked = gdn_blocked._hpu_solve_lower_triangular_batched(lmat,
+                                                                          eye,
+                                                                          use_vectorized=True,
+                                                                          neumann_iters=14)
+            out_neumann = gdn._hpu_solve_lower_triangular_batched(lmat, eye, use_vectorized=True, neumann_iters=14)
+            assert torch.equal(out_blocked, out_neumann)
 
 
 # ===================================================================
@@ -566,6 +629,23 @@ class TestChunkGatedDeltaRule:
 
         torch.testing.assert_close(out_chunk, out_recurrent, atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(state_chunk, state_recurrent, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("use_qk_l2norm", [False, True])
+    def test_blocked_chunk_vs_exact(self, gdn_blocked, gdn_exact, use_qk_l2norm):
+        """The chunk pipeline with the blocked solver matches the exact solver."""
+        B, T, H, K, HV, V = 1, 96, 2, 8, 2, 8
+        q, k, v, g, beta = _make_gdn_inputs(B, T, H, HV, K, V, seed=78)
+        kwargs = dict(chunk_size=64,
+                      output_final_state=True,
+                      prefill_num_seqs=B,
+                      prefill_seq_len=T,
+                      use_qk_l2norm_in_kernel=use_qk_l2norm)
+
+        out_blocked, state_blocked = gdn_blocked.hpu_chunk_gated_delta_rule(q, k, v, g, beta, **kwargs)
+        out_exact, state_exact = gdn_exact.hpu_chunk_gated_delta_rule(q, k, v, g, beta, **kwargs)
+
+        torch.testing.assert_close(out_blocked, out_exact, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(state_blocked, state_exact, atol=1e-4, rtol=1e-4)
 
     def test_chunk_with_padding(self, gdn):
         """seq_len not divisible by chunk_size should pad correctly."""
