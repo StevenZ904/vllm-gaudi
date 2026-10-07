@@ -159,6 +159,9 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     last_chunk_indices_p: Optional[torch.Tensor] = None
     load_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch,]
     store_indices_tensor: Optional[torch.Tensor] = None  # shape: [batch,]
+    # Decode only: per compact GDN layer, the rows [0, padded batch] of its
+    # state tensor (row 0 = padding), so the layer updates just those rows.
+    gdn_state_prefix: Optional[tuple[torch.Tensor, ...]] = None
 
 
 @dataclass

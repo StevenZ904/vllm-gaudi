@@ -5,6 +5,7 @@ import copy
 import contextlib
 from copy import deepcopy
 import functools
+import heapq
 from functools import partial, wraps
 import itertools
 import math
@@ -969,6 +970,9 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         self.interleaved_sliding_window = (is_interleaved(vllm_config.model_config.hf_text_config)
                                            and self.sliding_window)
         self.metadata_processor = HPUAttentionMetadataProcessor(vllm_config)
+        # Compact GDN layers, set by the model runner; forward hands each its
+        # decode state rows from the metadata's gdn_state_prefix.
+        self.gdn_prefix_layers: list[torch.nn.Module] = []
 
         # for DP
         self.dummy_num_input_tokens = -1
@@ -1051,6 +1055,12 @@ class HpuModelAdapter(torch.nn.Module, HpuKVConnectorModelRunnerMixin):
         attn_meta = kwargs.pop('attn_metadata', None)
         if 'kv_caches' in kwargs:
             kwargs.pop('kv_caches')
+        if self.gdn_prefix_layers:
+            # As module attributes, not metadata entries: a layer that picked
+            # its entry by a per-layer index would get its own compiled graph.
+            prefix_states = getattr(attn_meta, 'gdn_state_prefix', None)
+            for i, layer in enumerate(self.gdn_prefix_layers):
+                layer.gdn_decode_state = None if prefix_states is None else prefix_states[i]
 
         # If multimodal inputs, update kwargs
         model_mm_kwargs = kwargs.pop('model_mm_kwargs', None)
@@ -1165,7 +1175,7 @@ def trim_attn_metadata(metadata: HPUAttentionMetadataV1) -> object:
         'window_block_usage', 'window_block_groups', 'window_attn_bias', 'chunked_block_mapping', 'chunked_attn_bias',
         'chunked_block_list', 'chunked_block_usage', 'chunked_block_groups', 'prep_initial_states',
         'has_initial_states_p', 'last_chunk_indices_p', 'load_indices_tensor', 'store_indices_tensor',
-        'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
+        'gdn_state_prefix', 'query_start_loc', 'query_start_loc_p', 'padding_mask_flat', 'blocks_caching_range',
         'mamba_chunks_to_block_mapping', 'seqlens_offsets_for_blocks', 'image_seg_ids'
     ])
     return attention_metadata
@@ -1454,8 +1464,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Tensor size: max_num_reqs * num_gdn_groups + 2.
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
         self._compact_gdn_group_ids: set[int] = set()
-        self._gdn_slot_free_list: list[int] = []  # stack of free base-slot IDs
+        # Min-heap of free base-slot IDs: requests take the lowest free slot,
+        # so the rows in use stay packed at the front of the state tensors.
+        self._gdn_slot_free_list: list[int] = []
         self._gdn_req_to_base_slot: dict[str, int] = {}
+        # State tensors of the compact GDN layers, in the order of the
+        # adapter's gdn_prefix_layers.
+        self._gdn_prefix_states: list[torch.Tensor] = []
 
         # Lazy initialization
         # self.model: nn.Module  # set after load_model
@@ -1617,7 +1632,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     def _make_buffer(self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True) -> CpuGpuBuffer:
         return CpuGpuBuffer(*size, dtype=dtype, device=self.device, pin_memory=self.pin_memory, with_numpy=numpy)
 
-    def prepare_mamba_state_idxs(self, req_indices, block_table_offsets, target_bs):
+    def prepare_mamba_state_idxs(self, req_indices, block_table_offsets, target_bs, compact_pad=-1):
         num_indices = len(req_indices)
         all_state_indices_cpu = []
         compact_indices_cpu = None
@@ -1635,7 +1650,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone()
 
             if num_indices < target_bs:
-                pad_val = -1 if group_idx in self._compact_gdn_group_ids else self._MAMBA_PAD_BLOCK_ID
+                pad_val = compact_pad if group_idx in self._compact_gdn_group_ids else self._MAMBA_PAD_BLOCK_ID
                 padding = torch.full((target_bs - num_indices, ), pad_val, dtype=torch.int32, device='cpu')
                 state_indices_cpu = torch.cat([state_indices_cpu, padding])
 
@@ -1861,7 +1876,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             for req_id in sorted(scheduler_output.finished_req_ids):
                 base_slot = self._gdn_req_to_base_slot.pop(req_id, None)
                 if base_slot is not None:
-                    self._gdn_slot_free_list.append(base_slot)
+                    heapq.heappush(self._gdn_slot_free_list, base_slot)
                 else:
                     logger.warning("GDN_COMPACT free finished req=%s has NO slot! "
                                    "Possible leak.", req_id)
@@ -2004,7 +2019,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self._compact_gdn_group_ids:
             for req_id in req_ids_to_add:
                 if req_id not in self._gdn_req_to_base_slot:
-                    base_slot = self._gdn_slot_free_list.pop()
+                    base_slot = heapq.heappop(self._gdn_slot_free_list)
                     self._gdn_req_to_base_slot[req_id] = base_slot
                     logger.debug("GDN_COMPACT alloc req=%s base_slot=%d free_list_len=%d", req_id, base_slot,
                                  len(self._gdn_slot_free_list))
@@ -3194,6 +3209,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # PAD FOR STATIC SHAPES.
         padded_batch_size: int
         padded_batch_size = self.bucketing_manager.find_decode_bucket(num_decodes, sum(num_blocks), seek_buckets)[0]
+        if self._compact_gdn_group_ids:
+            # Compact GDN layers update state rows [0, padded_batch_size] in
+            # place during decode, so the batch must reach the highest row
+            # (base slot + 1) of its requests. Slots are handed out lowest
+            # first, so this only grows the batch while it is draining.
+            base_slots = self._gdn_req_to_base_slot
+            max_row = max((base_slots.get(req_id, -1) + 1 for req_id in self.input_batch.req_ids[:num_decodes]),
+                          default=0)
+            if max_row > padded_batch_size:
+                padded_batch_size = self.bucketing_manager.find_decode_bucket(max_row, sum(num_blocks), seek_buckets)[0]
 
         # dp aware padding
         padded_batch_size += self.get_dp_padding(padded_batch_size)
@@ -3363,6 +3388,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     padded_batch_size * num_tokens,
                     block_size=decode_block_size)
 
+        gdn_state_prefix = None
         if self.num_mamba_like_layers > 0:
             mamba_block_size = self.cache_config.mamba_block_size
             (block_idx_last_computed_token_cpu,
@@ -3383,8 +3409,14 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                                                         padded_batch_size)
             else:
                 zeros = [0] * len(req_indices)
+                # Padded decodes use the unused row 0 of compact GDN states.
                 load_state_indices_cpu = store_state_indices_cpu = \
-                    self.prepare_mamba_state_idxs(req_indices, zeros, padded_batch_size)
+                    self.prepare_mamba_state_idxs(req_indices, zeros, padded_batch_size, compact_pad=0)
+                # Taken here, outside the compiled layers: a layer that updates
+                # a slice of a graph input in place writes back the whole
+                # input, while a slice passed in as the input costs only its
+                # own rows.
+                gdn_state_prefix = tuple(state[:padded_batch_size + 1] for state in self._gdn_prefix_states) or None
 
             seq_lens_cpu = torch.tensor(num_tokens_per_req, dtype=torch.int32, device='cpu', pin_memory=self.pin_memory)
 
@@ -3474,6 +3506,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             store_indices_tensor=store_indices_tensor,
             seq_lens_tensor=seq_lens_tensor,
             query_start_loc=query_start_loc_p,
+            gdn_state_prefix=gdn_state_prefix,
         )
 
         return DecodeInputData(num_decodes=num_decodes,
@@ -7039,12 +7072,25 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # state tensors.
         if self._compact_gdn_group_ids:
             gdn_max_reqs = self._gdn_max_reqs
-            self._gdn_slot_free_list = list(range(gdn_max_reqs - 1, -1, -1))
+            self._gdn_slot_free_list = list(range(gdn_max_reqs))
             self._gdn_req_to_base_slot.clear()
             compact_total = gdn_max_reqs + 2
             logger.info("GDN compact: %d groups, %d base_slots, tensor_dim0=%d vs baseline=%d, free_list_len=%d",
                         len(self._compact_gdn_group_ids), gdn_max_reqs, compact_total, num_blocks + 1,
                         len(self._gdn_slot_free_list))
+            # Decode batches cover every row they touch (see
+            # _create_decode_input_data), so GDN layers may update just the
+            # first padded_batch_size + 1 rows in place.
+            forward_context = self.vllm_config.compilation_config.static_forward_context
+            self._gdn_prefix_states = []
+            gdn_prefix_layers = []
+            for group_idx in self._compact_gdn_group_ids:
+                for layer_name in kv_cache_config.kv_cache_groups[group_idx].layer_names:
+                    layer = forward_context.get(layer_name)
+                    if hasattr(layer, "gdn_decode_state"):
+                        gdn_prefix_layers.append(layer)
+                        self._gdn_prefix_states.append(layer.kv_cache[1])
+            getattr(self.model, "_orig_mod", self.model).gdn_prefix_layers = gdn_prefix_layers
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(self.get_kv_caches_4D(kv_caches))
