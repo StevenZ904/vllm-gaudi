@@ -1542,6 +1542,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.max_cudagraph_capture_size is None:
             self.max_cudagraph_capture_size = self.max_num_batched_tokens
         self.use_prefix_caching = (self.vllm_config.cache_config.enable_prefix_caching)
+        # Set in initialize_kv_cache once the model's layers are known.
+        self._can_merge_gdn_prefills = False
         self.bucketing_manager = HPUBucketingManager()
         max_num_prefill_seqs = self.max_num_seqs if self.use_merged_prefill \
                                else self.max_prefill_batch_size
@@ -2666,7 +2668,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Neither is prefix-caching-specific, so gate on the model type, not on
         # use_prefix_caching (which would also wrongly block merges for plain
         # attention models that CAN merge under prefix caching).
-        if self.num_mamba_like_layers > 0:
+        # GDN-only hybrids (Qwen3-Next / Qwen3.5) are the exception without
+        # prefix caching: their prefill kernels take a right-padded
+        # [bs, seq] batch with per-row lengths and state slots.
+        if self.num_mamba_like_layers > 0 and not self._can_merge_gdn_prefills:
             return False
         # --- Logic to handle chunked prefill/prefix caching for HPU ---
         # 1. Check basic states of LHS (accumulated batch) and RHS (incoming request).
@@ -2899,11 +2904,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         if self.num_mamba_like_layers > 0:
             # COMPUTE query_start_loc (similar to GPU)
             # This is a cumulative sum of query lengths
-            query_start_loc_p_cpu = torch.zeros(len(query_lens) + 1,
+            # One entry per padded batch row: padding rows get zero length, so
+            # the prefill kernels see target_bs sequences like every other
+            # per-row tensor (state indices, padding mask).
+            query_start_loc_p_cpu = torch.zeros(max(len(query_lens), target_bs) + 1,
                                                 dtype=torch.int32,
                                                 device='cpu',
                                                 pin_memory=self.pin_memory)
-            query_start_loc_p_cpu[1:] = torch.cumsum(torch.tensor(query_lens, dtype=torch.int32), dim=0)
+            query_start_loc_p_cpu[1:len(query_lens) + 1] = torch.cumsum(torch.tensor(query_lens, dtype=torch.int32),
+                                                                        dim=0)
+            query_start_loc_p_cpu[len(query_lens) + 1:] = query_start_loc_p_cpu[len(query_lens)]
 
             num_computed_tokens_p_cpu = torch.zeros(len(contents.req_ids), dtype=torch.int32)
 
@@ -6671,6 +6681,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 if self.enable_bucketing:
                     self.bucketing_manager.block_size = self.block_size
             maybe_set_mamba_kv_cache_groups_ids(self.model, self.kv_cache_config)
+            # Fresh prompts may share one padded prefill batch (see
+            # _can_merge_prefill_contents) only if every mamba-like layer
+            # handles per-row lengths and state slots in its prefill path.
+            # VLLM_PROMPT_BS_BUCKET_MAX caps the batch size.
+            mamba_layers = [
+                m for m in self.vllm_config.compilation_config.static_forward_context.values()
+                if isinstance(m, MambaBase)
+            ]
+            self._can_merge_gdn_prefills = (not self.use_prefix_caching and len(mamba_layers) > 0 and all(
+                getattr(m, "supports_padded_prefill_batch", False) for m in mamba_layers))
         self.initialize_attn_backend(kv_cache_config)
 
         # Reinitialize the input batch with the correct block sizes for all
