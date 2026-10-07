@@ -111,6 +111,46 @@ def _depthwise_conv1d_tpc(
     return out
 
 
+def _depthwise_conv1d_tpc_channels_last(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``_depthwise_conv1d_tpc`` for channels-last input.
+
+    x is (batch, L, dim) and the result is (batch, L - width + 1, dim). Each tap
+    is a contiguous slice along the token axis. The per-tap products and their
+    sum use the same dtypes and order as ``_depthwise_conv1d_tpc``.
+    """
+    # x:      (batch, L, dim)
+    # weight: (dim, width)
+    width = weight.shape[1]
+    if x.shape[1] < width:
+        raise ValueError(f"Input length ({x.shape[1]}) is smaller than kernel width"
+                         f" ({width}). Convolution is not defined for this configuration.")
+    out_len = x.shape[1] - width + 1
+
+    orig_dtype = x.dtype
+    needs_upcast = orig_dtype in (torch.bfloat16, torch.float16)
+
+    # (dim, width) -> (width, 1, dim)
+    w = weight.t().unsqueeze(1)
+    if needs_upcast:
+        w = w.float()
+
+    out = x[:, :out_len] * w[0]
+    for k in range(1, width):
+        out = out + x[:, k:k + out_len] * w[k]
+
+    if bias is not None:
+        out = out + (bias.float() if needs_upcast else bias)
+
+    if needs_upcast:
+        out = out.to(orig_dtype)
+
+    return out
+
+
 def _flatten_inputs_for_update(
     x: torch.Tensor,
     query_start_loc: torch.Tensor | None,
@@ -472,18 +512,21 @@ def hpu_causal_conv1d_fn_update(
     num_conv_slots = conv_states.shape[0]
     safe_cache_idx = torch.remainder(batch_cache_idx, num_conv_slots)
 
+    # conv_states is [slots, state_len, dim]: work along the token axis in that
+    # layout so neither the state nor the per-tap slices need a transpose.
     init_state = conv_states[safe_cache_idx, -state_len:, :]
-    init_state = init_state.transpose(-1, -2)
-
-    seq_input = torch.cat([init_state, x_work], dim=2)
-    new_state = seq_input[:, :, -state_len:]
+    seq_input = torch.cat([init_state, x_work.transpose(1, 2)], dim=1)  # [batch, state_len + L, dim]
+    new_state = seq_input[:, -state_len:, :]
     # Use element-wise TPC depthwise conv to avoid the MME
     # spatial_convolution input1 weight-transpose stall.
-    seq_out = _depthwise_conv1d_tpc(seq_input, weight_work, bias_work)
+    seq_out = _depthwise_conv1d_tpc_channels_last(seq_input, weight_work, bias_work)
     seq_out = _apply_activation(seq_out, activation)
-    out = seq_out
+    out = seq_out.transpose(1, 2)  # [batch, dim, L]
 
     with torch.no_grad():
-        conv_states[safe_cache_idx, -state_len:, :] = new_state.transpose(-1, -2)
+        if conv_states.shape[1] == state_len:
+            conv_states.index_copy_(0, safe_cache_idx.long(), new_state)
+        else:
+            conv_states[safe_cache_idx, -state_len:, :] = new_state
 
     return out.to(original_dtype)
