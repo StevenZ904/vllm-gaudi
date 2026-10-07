@@ -537,6 +537,33 @@ def _eager_read_state(state: torch.Tensor, idx: torch.Tensor, dtype: torch.dtype
     return state.index_select(0, idx).to(dtype)
 
 
+def _decode_step_all_slots(state: torch.Tensor, idx: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                           decay: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
+    """Single-token delta-rule step that updates every row of ``state`` in place.
+
+    When the batch covers most rows of a compact state tensor, updating all rows
+    is cheaper than gathering the batch's rows and scattering them back. Rows
+    outside the batch get decay 1, beta 0 and zero q/k/v, which leaves them
+    unchanged. With S' = decay * S + v_new k^T, the output S'^T q only needs
+    S k and S q of the old state.
+
+    state [rows, HV, V, K]; idx [N] row per sequence; q (pre-scaled) and k
+    [N, HV, K]; v [N, HV, V]; decay and beta [N, HV]. Returns [N, HV, V].
+    """
+    rows, HV, Vdim, Kdim = state.shape
+    kq = state.new_zeros(rows, HV, 2, Kdim).index_copy_(0, idx, torch.stack((k, q), dim=-2))
+    decay = state.new_ones(rows, HV).index_copy_(0, idx, decay)
+    v = state.new_zeros(rows, HV, Vdim).index_copy_(0, idx, v)
+    beta = state.new_zeros(rows, HV).index_copy_(0, idx, beta)
+    k, q = kq[:, :, 0], kq[:, :, 1]
+    # [2, K] x S^T is faster on HPU than S x [K, 2].
+    kw = torch.matmul(kq, state.transpose(-1, -2))  # [rows, HV, 2, V]
+    v_new = (v - decay.unsqueeze(-1) * kw[:, :, 0]) * beta.unsqueeze(-1)
+    out = decay.unsqueeze(-1) * kw[:, :, 1] + (k * q).sum(-1, keepdim=True) * v_new
+    state.mul_(decay[..., None, None]).add_(v_new.unsqueeze(-1) * k.unsqueeze(2))
+    return out.index_select(0, idx)
+
+
 def hpu_fused_recurrent_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -607,6 +634,21 @@ def hpu_fused_recurrent_gated_delta_rule(
             sidx = torch.remainder(sidx_raw, num_slots)
         else:
             sidx = torch.arange(num_seqs, dtype=torch.long, device=device)
+
+        # Batch covers most state rows (e.g. compact GDN near max_num_seqs):
+        # update all rows in place instead of gather + scatter.
+        if (ssm_state_indices is not None and inplace_final_state and final_state.dtype == _GDN_COMPUTE_DTYPE
+                and num_seqs * 3 >= final_state.shape[0] * 2):
+            qf = q.reshape(-1, H, Kdim).to(_GDN_COMPUTE_DTYPE)
+            kf = k.reshape(-1, H, Kdim).to(_GDN_COMPUTE_DTYPE)
+            if use_qk_l2norm_in_kernel:
+                qf = _l2norm_last_dim(qf)
+                kf = _l2norm_last_dim(kf)
+            out = _decode_step_all_slots(final_state, sidx, qf * scale, kf,
+                                         v.reshape(-1, HV, Vdim).to(_GDN_COMPUTE_DTYPE),
+                                         torch.exp(g.reshape(-1, HV).to(torch.float32)).to(_GDN_COMPUTE_DTYPE),
+                                         beta.reshape(-1, HV).to(_GDN_COMPUTE_DTYPE)).to(v.dtype)
+            return (out.unsqueeze(0) if cu_seqlens is not None else out.view(B, T, HV, Vdim)), final_state
 
         h_batch = _eager_read_state(final_state, sidx, _GDN_COMPUTE_DTYPE)
 

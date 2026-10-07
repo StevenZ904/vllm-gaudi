@@ -1447,8 +1447,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # Tensor size: max_num_reqs * num_gdn_groups + 2.
         self._compact_gdn_enabled = os.environ.get("VLLM_COMPACT_GDN", "1").strip().lower() in ("1", "true")
         self._compact_gdn_group_ids: set[int] = set()
-        self._compact_gdn_group_offset: dict[int, int] = {}  # {group_idx: g_offset}
-        self._num_gdn_groups = 0  # set during initialize_kv_cache
         self._gdn_slot_free_list: list[int] = []  # stack of free base-slot IDs
         self._gdn_req_to_base_slot: dict[str, int] = {}
 
@@ -1613,14 +1611,16 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
     def prepare_mamba_state_idxs(self, req_indices, block_table_offsets, target_bs):
         num_indices = len(req_indices)
         all_state_indices_cpu = []
+        compact_indices_cpu = None
         for group_idx in range(len(self.input_batch.block_table.block_tables)):
             if group_idx in self._compact_gdn_group_ids:
-                g_offset = self._compact_gdn_group_offset[group_idx]
-                state_indices_cpu = torch.zeros(num_indices, dtype=torch.int32)
-                for i, req_idx in enumerate(req_indices):
-                    req_id = self.input_batch.req_ids[req_idx]
-                    base_slot = self._gdn_req_to_base_slot[req_id]
-                    state_indices_cpu[i] = base_slot * self._num_gdn_groups + g_offset + 1
+                # Every compact group indexes its states by request slot alone.
+                if compact_indices_cpu is None:
+                    req_ids = self.input_batch.req_ids
+                    base_slots = self._gdn_req_to_base_slot
+                    compact_indices_cpu = torch.tensor([base_slots[req_ids[i]] + 1 for i in req_indices],
+                                                       dtype=torch.int32)
+                state_indices_cpu = compact_indices_cpu
             else:
                 block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
                 state_indices_cpu = block_table_cpu_tensor[req_indices, block_table_offsets].clone()
@@ -6631,7 +6631,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             cache size of each layer
         """
         self._compact_gdn_group_ids.clear()
-        self._compact_gdn_group_offset.clear()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
@@ -6695,12 +6694,6 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         kv_caches: dict[str, torch.Tensor] = {}
         num_blocks = 0
 
-        # Pre-count GDN groups for compact allocation (shared by both
-        # hybrid and naive_mamba_cache_sharing paths).
-        if self.num_mamba_like_layers > 0 and self._compact_gdn_enabled:
-            self._num_gdn_groups = sum(
-                1 for g in kv_cache_config.kv_cache_groups
-                if isinstance(g.kv_cache_spec, MambaSpec) and g.kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES)
         # Profiling may request more sequences than max_num_seqs
         # (e.g. VLLM_PROFILE_DECODE=16,64 with max_num_seqs=1).
         # Ensure GDN compact tensors and free-list are large enough.
@@ -6718,14 +6711,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
         # different groups shared one. #51718 turned that field into `.layers`,
         # which coalesces *all* of a group's layers at distinct byte offsets, so
         # propagating across it now collapses a whole group onto one state.
-        # State slots are selected per group (compact GDN:
-        # base_slot * num_gdn_groups + g_offset + 1; otherwise the group's own
-        # block table), so only the tensor identity can separate layers inside a
-        # group. Key by position to restore the pre-#51718 sharing.
+        # State slots are selected per group (the group's own block table), so
+        # only the tensor identity can separate layers inside a group. Key by
+        # position to restore the pre-#51718 sharing. Compact GDN states are
+        # indexed by request slot alone and key by layer name instead.
         mamba_state_cache: dict[tuple, tuple[torch.Tensor, ...]] = {}
 
-        def _mamba_state_tensors(spec: MambaSpec, layer_pos: int, num_slots: int) -> tuple[torch.Tensor, ...]:
-            key = (spec, layer_pos, num_slots)
+        def _mamba_state_tensors(spec: MambaSpec, layer_key: Union[int, str],
+                                 num_slots: int) -> tuple[torch.Tensor, ...]:
+            key = (spec, layer_key, num_slots)
             tensors = mamba_state_cache.get(key)
             if tensors is None:
                 tensors = tuple(
@@ -6818,17 +6812,15 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES and \
                             self._compact_gdn_enabled:
-                        # GDN/linear_attention: compact allocation.
-                        # All GDN groups share the same state tensor, so each
-                        # request needs _num_gdn_groups distinct indices.
-                        # Total slots: max_num_reqs * num_gdn_groups + 2
-                        # (slot 0 unused, last slot for -1 padding).
+                        # GDN/linear_attention: compact allocation, one state
+                        # tensor per layer with a row per request slot.
+                        # Total slots: max_num_reqs + 2 (slot 0 unused, last
+                        # slot for -1 padding).
                         self._compact_gdn_group_ids.add(group_idx)
-                        gdn_max_reqs = self._gdn_max_reqs
-                        compact_total = gdn_max_reqs * self._num_gdn_groups + 2
-                        logger.debug("GDN compact tensor: %d slots (max_reqs=%d * groups=%d + 2) vs baseline %d",
-                                     compact_total, gdn_max_reqs, self._num_gdn_groups, num_blocks + 1)
-                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
+                        compact_total = self._gdn_max_reqs + 2
+                        logger.debug("GDN compact tensor: %d slots (max_reqs=%d + 2) vs baseline %d", compact_total,
+                                     self._gdn_max_reqs, num_blocks + 1)
+                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_name, compact_total)
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES:
                         # GDN/linear_attention: non-compact (baseline) allocation
@@ -6895,9 +6887,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                             self._compact_gdn_enabled:
                         # GDN/linear_attention: compact allocation.
                         self._compact_gdn_group_ids.add(group_idx)
-                        gdn_max_reqs = self._gdn_max_reqs
-                        compact_total = gdn_max_reqs * self._num_gdn_groups + 2
-                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_pos, compact_total)
+                        compact_total = self._gdn_max_reqs + 2
+                        kv_caches[layer_name] = _mamba_state_tensors(kv_cache_spec, layer_name, compact_total)
                     elif isinstance(kv_cache_spec, MambaSpec) and \
                             kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES:
                         # GDN/linear_attention: non-compact (baseline) allocation.
@@ -7007,14 +6998,13 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
 
         # Initialize the GDN compact slot free-list.
         # The free-list contains base-slot IDs [0..max_num_reqs-1].
-        # For request with base_slot `s` in group `g` (0-indexed within
-        # compact groups), the tensor index is s * num_gdn_groups + g + 1.
+        # A request with base_slot `s` uses row s + 1 of every GDN layer's
+        # state tensors.
         if self._compact_gdn_group_ids:
-            self._compact_gdn_group_offset = {gid: i for i, gid in enumerate(sorted(self._compact_gdn_group_ids))}
             gdn_max_reqs = self._gdn_max_reqs
             self._gdn_slot_free_list = list(range(gdn_max_reqs - 1, -1, -1))
             self._gdn_req_to_base_slot.clear()
-            compact_total = gdn_max_reqs * self._num_gdn_groups + 2
+            compact_total = gdn_max_reqs + 2
             logger.info("GDN compact: %d groups, %d base_slots, tensor_dim0=%d vs baseline=%d, free_list_len=%d",
                         len(self._compact_gdn_group_ids), gdn_max_reqs, compact_total, num_blocks + 1,
                         len(self._gdn_slot_free_list))
